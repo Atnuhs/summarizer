@@ -485,3 +485,158 @@ func findSubstring(s, substr string) int {
 	}
 	return -1
 }
+
+func TestUsageAnalyzer_findReferencedSymbols(t *testing.T) {
+	// Create a minimal test case
+	tempDir := t.TempDir()
+	
+	// Create main.go
+	mainContent := `package main
+
+import "test/math"
+
+func main() {
+	result := math.Add(1, 2)
+	calc := &math.Calculator{}
+	calc.Multiply(result)
+}
+`
+	
+	// Create math package
+	mathDir := filepath.Join(tempDir, "math")
+	err := os.MkdirAll(mathDir, 0755)
+	if err != nil {
+		t.Fatalf("Failed to create math dir: %v", err)
+	}
+	
+	mathContent := `package math
+
+func Add(a, b int) int {
+	return a + b
+}
+
+func Subtract(a, b int) int {
+	return a - b
+}
+
+type Calculator struct {
+	Value int
+}
+
+func (c *Calculator) Multiply(x int) {
+	c.Value *= x
+}
+
+type UnusedType struct {
+	Data string
+}
+`
+	
+	err = os.WriteFile(filepath.Join(tempDir, "main.go"), []byte(mainContent), 0644)
+	if err != nil {
+		t.Fatalf("Failed to write main.go: %v", err)
+	}
+	
+	err = os.WriteFile(filepath.Join(mathDir, "math.go"), []byte(mathContent), 0644)
+	if err != nil {
+		t.Fatalf("Failed to write math.go: %v", err)
+	}
+	
+	// Create go.mod
+	goModContent := `module test
+
+go 1.21`
+	err = os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte(goModContent), 0644)
+	if err != nil {
+		t.Fatalf("Failed to write go.mod: %v", err)
+	}
+	
+	// Test the bundler with this setup
+	bundler := NewBundler()
+	inputFile := filepath.Join(tempDir, "main.go")
+	outputFile := filepath.Join(tempDir, "output.go")
+	
+	err = bundler.Bundle(inputFile, outputFile)
+	if err != nil {
+		t.Fatalf("Bundle failed: %v", err)
+	}
+	
+	// Read and verify output
+	content, err := os.ReadFile(outputFile)
+	if err != nil {
+		t.Fatalf("Failed to read output: %v", err)
+	}
+	
+	contentStr := string(content)
+	
+	// Should include used symbols
+	expectedPresent := []string{
+		"math_Add",
+		"math_Calculator",
+		"func (c *math_Calculator) Multiply",
+	}
+	
+	for _, expected := range expectedPresent {
+		if !containsString(contentStr, expected) {
+			t.Errorf("Expected symbol %q not found in output", expected)
+		}
+	}
+	
+	// Should NOT include unused symbols
+	unexpectedAbsent := []string{
+		"math_Subtract",
+		"math_UnusedType",
+	}
+	
+	for _, unexpected := range unexpectedAbsent {
+		if containsString(contentStr, unexpected) {
+			t.Errorf("Unexpected symbol %q found in output", unexpected)
+		}
+	}
+}
+
+func TestUsageAnalyzer_ComplexDependencies(t *testing.T) {
+	bundler := NewBundler()
+	
+	// Test with the complex unused test case
+	tempDir := t.TempDir()
+	err := copyDir("testdata/with-unused", tempDir)
+	if err != nil {
+		t.Fatalf("Failed to copy test data: %v", err)
+	}
+	
+	inputFile := filepath.Join(tempDir, "main.go")
+	outputFile := filepath.Join(tempDir, "result.go")
+	
+	err = bundler.Bundle(inputFile, outputFile)
+	if err != nil {
+		t.Fatalf("Bundle failed: %v", err)
+	}
+	
+	content, err := os.ReadFile(outputFile)
+	if err != nil {
+		t.Fatalf("Failed to read output: %v", err)
+	}
+	
+	contentStr := string(content)
+	lines := len(strings.Split(contentStr, "\n"))
+	
+	// Verify significant size reduction
+	if lines > 80 {
+		t.Errorf("Expected significant dead code elimination, but got %d lines", lines)
+	}
+	
+	// Verify critical functionality is preserved
+	expectedFunctions := []string{
+		"math_Add",
+		"math_Multiply", 
+		"utils_PrintMessage",
+		"utils_NewLogger",
+	}
+	
+	for _, fn := range expectedFunctions {
+		if !containsString(contentStr, fn) {
+			t.Errorf("Critical function %q missing from output", fn)
+		}
+	}
+}
