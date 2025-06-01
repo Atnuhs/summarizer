@@ -15,6 +15,20 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+type UsageAnalyzer struct {
+	fset        *token.FileSet
+	pkgCache    map[string]*packages.Package
+	usedSymbols map[string]map[string]bool
+}
+
+func NewUsageAnalyzer(fset *token.FileSet, pkgCache map[string]*packages.Package) *UsageAnalyzer {
+	return &UsageAnalyzer{
+		fset:        fset,
+		pkgCache:    pkgCache,
+		usedSymbols: make(map[string]map[string]bool),
+	}
+}
+
 type Bundler struct {
 	fset         *token.FileSet
 	pkgCache     map[string]*packages.Package
@@ -151,45 +165,222 @@ func (b *Bundler) contains(slice []string, item string) bool {
 	return slices.Contains(slice, item)
 }
 
-func (b *Bundler) performCallGraphAnalysis() error {
-	for _, depPath := range b.dependencies {
-		pkg := b.pkgCache[depPath]
-		if pkg == nil {
-			continue
-		}
+func (ua *UsageAnalyzer) AnalyzeUsage(mainPkg *packages.Package, dependencies []string) error {
+	// First, find what symbols are actually referenced from main package
+	referencedSymbols := ua.findReferencedSymbols(mainPkg, dependencies)
+	
+	// Then recursively find all symbols used by those symbols
+	for _, depPath := range dependencies {
+		ua.usedSymbols[depPath] = make(map[string]bool)
+		ua.markUsedSymbols(depPath, referencedSymbols[depPath])
+	}
+	
+	return nil
+}
 
-		b.usedSymbols[depPath] = make(map[string]bool)
-		
-		for _, file := range pkg.Syntax {
-			ast.Inspect(file, func(n ast.Node) bool {
-				switch node := n.(type) {
-				case *ast.FuncDecl:
-					if node.Name.IsExported() {
-						symbolName := node.Name.Name
-						b.usedSymbols[depPath][symbolName] = true
+func (ua *UsageAnalyzer) findReferencedSymbols(mainPkg *packages.Package, dependencies []string) map[string]map[string]bool {
+	referenced := make(map[string]map[string]bool)
+	
+	// Initialize maps for all dependencies
+	for _, depPath := range dependencies {
+		referenced[depPath] = make(map[string]bool)
+	}
+	
+	// Analyze main package files for references to dependency symbols
+	for _, file := range mainPkg.Syntax {
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.SelectorExpr:
+				// Handle package.Symbol references
+				if ident, ok := node.X.(*ast.Ident); ok {
+					for _, depPath := range dependencies {
+						pkgName := filepath.Base(depPath)
+						if ident.Name == pkgName {
+							referenced[depPath][node.Sel.Name] = true
+						}
 					}
-				case *ast.TypeSpec:
-					if node.Name.IsExported() {
-						symbolName := node.Name.Name
-						b.usedSymbols[depPath][symbolName] = true
-					}
-				case *ast.GenDecl:
-					if node.Tok == token.VAR || node.Tok == token.CONST {
-						for _, spec := range node.Specs {
-							if valueSpec, ok := spec.(*ast.ValueSpec); ok {
-								for _, name := range valueSpec.Names {
-									if name.IsExported() {
-										b.usedSymbols[depPath][name.Name] = true
-									}
-								}
+				}
+			case *ast.CallExpr:
+				// Handle constructor calls and type instantiations
+				if selExpr, ok := node.Fun.(*ast.SelectorExpr); ok {
+					if ident, ok := selExpr.X.(*ast.Ident); ok {
+						for _, depPath := range dependencies {
+							pkgName := filepath.Base(depPath)
+							if ident.Name == pkgName {
+								referenced[depPath][selExpr.Sel.Name] = true
 							}
 						}
 					}
 				}
-				return true
-			})
+			case *ast.CompositeLit:
+				// Handle struct literals like &math.Calculator{}
+				if selExpr, ok := node.Type.(*ast.SelectorExpr); ok {
+					if ident, ok := selExpr.X.(*ast.Ident); ok {
+						for _, depPath := range dependencies {
+							pkgName := filepath.Base(depPath)
+							if ident.Name == pkgName {
+								referenced[depPath][selExpr.Sel.Name] = true
+							}
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
+	
+	return referenced
+}
+
+func (ua *UsageAnalyzer) markUsedSymbols(depPath string, directlyUsed map[string]bool) {
+	pkg := ua.pkgCache[depPath]
+	if pkg == nil {
+		return
+	}
+
+	// Start with directly referenced symbols
+	toProcess := make(map[string]bool)
+	for symbol := range directlyUsed {
+		toProcess[symbol] = true
+		ua.usedSymbols[depPath][symbol] = true
+	}
+	
+	// Find dependencies of used symbols (methods, embedded types, etc.)
+	ua.findSymbolDependencies(depPath, toProcess)
+}
+
+func (ua *UsageAnalyzer) findSymbolDependencies(depPath string, symbols map[string]bool) {
+	pkg := ua.pkgCache[depPath]
+	if pkg == nil {
+		return
+	}
+	
+	processed := make(map[string]bool)
+	queue := make([]string, 0, len(symbols))
+	
+	// Initialize queue with directly used symbols
+	for symbol := range symbols {
+		queue = append(queue, symbol)
+	}
+	
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		
+		if processed[current] {
+			continue
+		}
+		processed[current] = true
+		
+		// Find what this symbol depends on
+		dependencies := ua.getSymbolDependencies(pkg, current)
+		for dep := range dependencies {
+			if !ua.usedSymbols[depPath][dep] {
+				ua.usedSymbols[depPath][dep] = true
+				queue = append(queue, dep)
+			}
 		}
 	}
+}
+
+func (ua *UsageAnalyzer) getSymbolDependencies(pkg *packages.Package, symbolName string) map[string]bool {
+	dependencies := make(map[string]bool)
+	
+	for _, file := range pkg.Syntax {
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.FuncDecl:
+				// If this is the function we're analyzing
+				if node.Name.Name == symbolName {
+					// Find what types and functions it uses
+					ast.Inspect(node, func(inner ast.Node) bool {
+						if ident, ok := inner.(*ast.Ident); ok {
+							// Check if this identifier refers to an exported symbol in the same package
+							if ident.IsExported() && ident.Name != symbolName {
+								if ua.isDefinedInPackage(pkg, ident.Name) {
+									dependencies[ident.Name] = true
+								}
+							}
+						}
+						return true
+					})
+				}
+			case *ast.TypeSpec:
+				// If this is the type we're analyzing
+				if node.Name.Name == symbolName {
+					// Find embedded types and field types
+					ast.Inspect(node.Type, func(inner ast.Node) bool {
+						if ident, ok := inner.(*ast.Ident); ok {
+							if ident.IsExported() && ident.Name != symbolName {
+								if ua.isDefinedInPackage(pkg, ident.Name) {
+									dependencies[ident.Name] = true
+								}
+							}
+						}
+						return true
+					})
+				}
+			}
+			return true
+		})
+	}
+	
+	return dependencies
+}
+
+func (ua *UsageAnalyzer) isDefinedInPackage(pkg *packages.Package, symbolName string) bool {
+	for _, file := range pkg.Syntax {
+		for _, decl := range file.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Name.Name == symbolName && d.Name.IsExported() {
+					return true
+				}
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					switch s := spec.(type) {
+					case *ast.TypeSpec:
+						if s.Name.Name == symbolName && s.Name.IsExported() {
+							return true
+						}
+					case *ast.ValueSpec:
+						for _, name := range s.Names {
+							if name.Name == symbolName && name.IsExported() {
+								return true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (ua *UsageAnalyzer) GetUsedSymbols() map[string]map[string]bool {
+	return ua.usedSymbols
+}
+
+func (b *Bundler) performCallGraphAnalysis() error {
+	// Get main package for analysis
+	var mainPkg *packages.Package
+	for _, pkg := range b.pkgCache {
+		if pkg.Name == "main" {
+			mainPkg = pkg
+			break
+		}
+	}
+	
+	if mainPkg == nil {
+		return fmt.Errorf("main package not found")
+	}
+	
+	analyzer := NewUsageAnalyzer(b.fset, b.pkgCache)
+	if err := analyzer.AnalyzeUsage(mainPkg, b.dependencies); err != nil {
+		return err
+	}
+	
+	b.usedSymbols = analyzer.GetUsedSymbols()
 	return nil
 }
 
@@ -247,7 +438,7 @@ func (b *Bundler) writeDependencyCode(output *strings.Builder) error {
 		output.WriteString(fmt.Sprintf("// From package %s\n", pkgName))
 
 		for _, file := range pkg.Syntax {
-			if err := b.processFile(file, pkgName, output); err != nil {
+			if err := b.processFile(file, pkgName, depPath, output); err != nil {
 				return err
 			}
 		}
@@ -271,19 +462,27 @@ func (b *Bundler) writeMainCode(inputFile string, output *strings.Builder) error
 	return nil
 }
 
-func (b *Bundler) processFile(file *ast.File, pkgPrefix string, output *strings.Builder) error {
+func (b *Bundler) processFile(file *ast.File, pkgPrefix, depPath string, output *strings.Builder) error {
+	usedSymbols := b.usedSymbols[depPath]
+	if usedSymbols == nil {
+		usedSymbols = make(map[string]bool)
+	}
+	
 	// Create a map to track original type names to prefixed names
 	typeMap := make(map[string]string)
 	
-	// First pass: collect and rename exported types
+	// First pass: collect used exported types and prepare renaming map
+	// Don't rename yet, just collect
 	for _, decl := range file.Decls {
 		if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.TYPE {
 			for _, spec := range genDecl.Specs {
 				if typeSpec, ok := spec.(*ast.TypeSpec); ok && typeSpec.Name.IsExported() {
 					oldName := typeSpec.Name.Name
-					newName := pkgPrefix + "_" + oldName
-					typeSpec.Name.Name = newName
-					typeMap[oldName] = newName
+					// Only process if this type is used
+					if usedSymbols[oldName] {
+						newName := pkgPrefix + "_" + oldName
+						typeMap[oldName] = newName
+					}
 				}
 			}
 		}
@@ -312,9 +511,27 @@ func (b *Bundler) processFile(file *ast.File, pkgPrefix string, output *strings.
 			if d.Name.Name == "init" {
 				continue
 			}
-			// Only add prefix to exported functions that are NOT methods
+			// Only process exported functions that are used and are NOT methods
 			if d.Name.IsExported() && d.Recv == nil {
+				if !usedSymbols[d.Name.Name] {
+					continue // Skip unused functions
+				}
 				d.Name.Name = pkgPrefix + "_" + d.Name.Name
+			} else if d.Name.IsExported() && d.Recv != nil {
+				// For methods, check if the receiver type is used
+				if starExpr, ok := d.Recv.List[0].Type.(*ast.StarExpr); ok {
+					if ident, ok := starExpr.X.(*ast.Ident); ok {
+						if !usedSymbols[ident.Name] {
+							continue // Skip methods of unused types
+						}
+					}
+				} else if ident, ok := d.Recv.List[0].Type.(*ast.Ident); ok {
+					if !usedSymbols[ident.Name] {
+						continue // Skip methods of unused types
+					}
+				}
+			} else if !d.Name.IsExported() {
+				continue // Skip unexported functions
 			}
 			
 			var buf strings.Builder
@@ -329,23 +546,57 @@ func (b *Bundler) processFile(file *ast.File, pkgPrefix string, output *strings.
 				continue
 			}
 
+			// Filter specs to only include used symbols
+			var filteredSpecs []ast.Spec
+			
 			for _, spec := range d.Specs {
 				switch s := spec.(type) {
-				case *ast.ValueSpec:
-					for _, name := range s.Names {
-						if name.IsExported() {
-							name.Name = pkgPrefix + "_" + name.Name
+				case *ast.TypeSpec:
+					if s.Name.IsExported() && usedSymbols[s.Name.Name] {
+						// Apply prefix using the typeMap
+						if newName, exists := typeMap[s.Name.Name]; exists {
+							s.Name.Name = newName
 						}
+						filteredSpecs = append(filteredSpecs, s)
+					}
+				case *ast.ValueSpec:
+					var filteredNames []*ast.Ident
+					var filteredValues []ast.Expr
+					
+					for i, name := range s.Names {
+						if name.IsExported() && usedSymbols[name.Name] {
+							name.Name = pkgPrefix + "_" + name.Name
+							filteredNames = append(filteredNames, name)
+							if s.Values != nil && i < len(s.Values) {
+								filteredValues = append(filteredValues, s.Values[i])
+							}
+						}
+					}
+					
+					if len(filteredNames) > 0 {
+						newSpec := &ast.ValueSpec{
+							Names:  filteredNames,
+							Type:   s.Type,
+							Values: filteredValues,
+						}
+						filteredSpecs = append(filteredSpecs, newSpec)
 					}
 				}
 			}
 
-			var buf strings.Builder
-			if err := format.Node(&buf, b.fset, d); err != nil {
-				return err
+			if len(filteredSpecs) > 0 {
+				newDecl := &ast.GenDecl{
+					Tok:   d.Tok,
+					Specs: filteredSpecs,
+				}
+				
+				var buf strings.Builder
+				if err := format.Node(&buf, b.fset, newDecl); err != nil {
+					return err
+				}
+				output.WriteString(buf.String())
+				output.WriteString("\n\n")
 			}
-			output.WriteString(buf.String())
-			output.WriteString("\n\n")
 		}
 	}
 	return nil
@@ -435,6 +686,28 @@ func (b *Bundler) rewriteMainFile(file *ast.File) {
 						})
 					}
 				}
+			}
+		case *ast.CompositeLit:
+			// Handle struct literals like &math.Calculator{}
+			if selExpr, ok := node.Type.(*ast.SelectorExpr); ok {
+				if ident, ok := selExpr.X.(*ast.Ident); ok {
+					if _, exists := pkgMap[ident.Name]; exists {
+						newIdent := &ast.Ident{
+							Name:    ident.Name + "_" + selExpr.Sel.Name,
+							NamePos: selExpr.Pos(),
+						}
+						replaceNodes = append(replaceNodes, func() {
+							node.Type = newIdent
+						})
+					}
+				}
+			}
+		case *ast.SelectorExpr:
+			// Handle method calls like calc.Add()
+			if ident, ok := node.X.(*ast.Ident); ok {
+				// This handles cases where we have prefixed types
+				// but we need to be careful not to change method calls on local variables
+				_ = ident // placeholder for now
 			}
 		}
 		return true
