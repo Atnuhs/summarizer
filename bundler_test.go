@@ -15,7 +15,7 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func buildPackages(t *testing.T, dir string) []*packages.Package {
+func loadTestPackage(t *testing.T, dir string) []*packages.Package {
 	t.Helper()
 	pkgs, err := loadPackages(filepath.Join("testdata/src", dir))
 	if err != nil {
@@ -43,7 +43,7 @@ func TestBundler(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// prepare
-			pkgs := buildPackages(t, tt.testdir)
+			pkgs := loadTestPackage(t, tt.testdir)
 
 			// execute
 			buf := bytes.NewBuffer(make([]byte, 0, 1024))

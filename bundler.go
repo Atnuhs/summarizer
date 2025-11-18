@@ -326,17 +326,17 @@ func isTopLevelDecleated(pkg *packages.Package, info *types.Info, id *ast.Ident)
 // isPkgSelector returns pkgPath if sel is pkg.Sel
 func isPkgSelector(sel *ast.SelectorExpr, info *types.Info) (pkgPath, bool) {
 	if info.Selections[sel] != nil {
-		// 構造体のフィールド or メソッドなので見ない
+		// ignore structure field and method
 		return "", false
 	}
 
-	// Ident(pkgName).Selなので、xがIdentのものだけ見る
+	// X should be Ident
 	xid, ok := sel.X.(*ast.Ident)
 	if !ok {
 		return "", false
 	}
 
-	// xidはパッケージ名であるべき
+	// X should be used at pkgName
 	pkgName, ok := info.Uses[xid].(*types.PkgName)
 	if !ok || pkgName == nil {
 		return "", false
@@ -347,6 +347,7 @@ func isPkgSelector(sel *ast.SelectorExpr, info *types.Info) (pkgPath, bool) {
 		return "", false
 	}
 
+	//should be non std pkg
 	pp := pkgPath(p.Path())
 	if isStd(pp) {
 		return "", false

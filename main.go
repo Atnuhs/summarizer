@@ -30,8 +30,8 @@ func main() {
 		log.Fatalf("load packages: %v", err)
 	}
 
+	// execute summarize
 	var raw bytes.Buffer
-
 	if err := Bundle(pkgs, &raw); err != nil {
 		log.Fatalf("bundle: %v", err)
 	}

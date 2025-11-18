@@ -102,7 +102,6 @@ func (a *ReachabilityAnalyzer) buildDeclGraph() {
 			continue
 		}
 
-		// A, B = Cならば、A -> C, B -> Cの辺を張りたい
 		for _, f := range p.Syntax {
 			for _, decl := range f.Decls {
 				switch d := decl.(type) {
@@ -234,44 +233,65 @@ type declUseVisitor struct {
 	reachableFunc map[*ssa.Function]bool
 	reachableDecl map[types.Object]bool
 
-	stack   []ast.Node
-	funcIds []int
+	// Visitの処理で今見ているnodeの全祖先をstackで管理している
+	stack []ast.Node
+	// stackに貯められた祖先の中で、reachableな関数のstackスライスでのindexを持っている
+	fnStack []*ssa.Function
+}
+
+func (v *declUseVisitor) push(n ast.Node) {
+	v.stack = append(v.stack, n)
+	if fn, ok := v.nodeToFn[n]; ok {
+		v.fnStack = append(v.fnStack, fn)
+	}
+}
+
+func (v *declUseVisitor) pop() {
+	if len(v.stack) == 0 {
+		return
+	}
+
+	poped := v.stack[len(v.stack)-1]
+	v.stack = v.stack[:len(v.stack)-1]
+
+	if fn, ok := v.nodeToFn[poped]; ok && len(v.fnStack) > 0 {
+		if v.fnStack[len(v.fnStack)-1] == fn {
+			v.fnStack = v.fnStack[:len(v.fnStack)-1]
+		}
+	}
+}
+
+func (v *declUseVisitor) curFn() *ssa.Function {
+	if len(v.fnStack) == 0 {
+		return nil
+	}
+	return v.fnStack[len(v.fnStack)-1]
 }
 
 func (v *declUseVisitor) Visit(n ast.Node) ast.Visitor {
 	// nがnilなのはそのサブツリーを抜ける時
 	if n == nil {
-		if len(v.stack) == 0 {
-			return v
-		}
-		v.stack = v.stack[:len(v.stack)-1]
-		if len(v.funcIds) > 0 && len(v.stack) == v.funcIds[len(v.funcIds)-1] {
-			v.funcIds = v.funcIds[:len(v.funcIds)-1]
-		}
+		v.pop()
 		return v
 	}
 
 	// nodeに入るタイミング
-	switch n.(type) {
-	case *ast.FuncDecl, *ast.FuncLit:
-		if _, ok := v.nodeToFn[n]; ok {
-			v.funcIds = append(v.funcIds, len(v.stack))
-		}
-	}
-	v.stack = append(v.stack, n)
+	v.push(n)
 
-	var cur *ssa.Function
-	if len(v.funcIds) > 0 {
-		lastFuncNode := v.stack[v.funcIds[len(v.funcIds)-1]]
-		cur = v.nodeToFn[lastFuncNode]
+
+	// reachableな関数で利用のある要素なら、reachableDeclに追加
+	id, ok := n.(*ast.Ident)
+	if !ok {
+		return v
 	}
 
-	if id, ok := n.(*ast.Ident); ok {
-		if obj := v.info.Uses[id]; obj != nil {
-			if cur != nil && v.reachableFunc[cur] {
-				v.reachableDecl[obj] = true
-			}
-		}
+	obj := v.info.Uses[id]
+	if obj == nil {
+		return v
+	}
+
+	if cur := v.curFn(); cur != nil || v.reachableFunc[cur] {
+		v.reachableDecl[obj] = true
 	}
 	return v
 }
