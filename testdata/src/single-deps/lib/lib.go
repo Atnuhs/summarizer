@@ -2,8 +2,14 @@ package lib
 
 import "fmt"
 
+type V int
+
 type LibStruct struct {
-	V int
+	V V
+}
+
+func (v LibStruct) Print() {
+	fmt.Println(v.V)
 }
 
 var LibStruct1 = LibStruct{}

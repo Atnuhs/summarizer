@@ -174,11 +174,7 @@ func (b *Bundler) buildDeclFile() (*ast.File, error) {
 							if varSpec, ok := spec.(*ast.ValueSpec); ok {
 								var used bool
 								for _, name := range varSpec.Names {
-									obj, ok := info.Defs[name]
-									if !ok {
-										continue
-									}
-									if isPkgLevelVar(obj) && reachable[obj] {
+									if obj, ok := info.Defs[name]; ok && isPkgLevelVar(obj) && reachable[obj] {
 										used = true
 									}
 								}
@@ -192,7 +188,7 @@ func (b *Bundler) buildDeclFile() (*ast.File, error) {
 						for _, spec := range v.Specs {
 							if constSpec, ok := spec.(*ast.ValueSpec); ok {
 								for _, name := range constSpec.Names {
-									if obj, ok := info.Defs[name]; ok && reachable[obj] {
+									if obj, ok := info.Defs[name]; ok && isPkgLevelConst(obj) && reachable[obj] {
 										used = true
 									}
 								}
@@ -204,6 +200,12 @@ func (b *Bundler) buildDeclFile() (*ast.File, error) {
 					}
 				case *ast.FuncDecl:
 					if obj, ok := info.Defs[v.Name]; ok && reachable[obj] {
+						if !isFuncNonMethod(obj) {
+							// method
+							builder.addFuncDecl(v)
+							break
+						}
+						// func
 						switch v.Name.Name {
 						case "init":
 							builder.addInitDecl(v)
@@ -246,7 +248,7 @@ func (b *Bundler) rewriteSelector(c *astutil.Cursor, n *ast.SelectorExpr) {
 			dst := ast.NewIdent(prefixAdded)
 			dst.NamePos = n.Sel.NamePos
 			c.Replace(dst)
-			b.replaced[dst] = prefixAdded
+			b.replaced[n.Sel] = prefixAdded
 		}
 	} else if pp, ok := isEmbeddedSel(n, info); ok {
 		if prefixAdded, ok := b.addPrefix(pp, n.Sel); ok {
@@ -319,24 +321,28 @@ func isPkgLevelVar(obj types.Object) bool {
 	return v.Parent() == pkg.Scope()
 }
 
-func isPkgLevelIdent(pkg *packages.Package, info *types.Info, id *ast.Ident) bool {
-	if id == nil || id.Name == "_" {
+func isPkgLevelConst(obj types.Object) bool {
+	v, ok := obj.(*types.Const)
+	if !ok {
 		return false
 	}
+	pkg := v.Pkg()
+	if pkg == nil {
+		return false
+	}
+	return v.Parent() == pkg.Scope()
+}
 
-	var obj types.Object
-	if o := info.Uses[id]; o != nil {
-		obj = o
-	} else if o := info.Defs[id]; o != nil {
-		obj = o
-	} else {
+func isFuncNonMethod(obj types.Object) bool {
+	fn, ok := obj.(*types.Func)
+	if !ok {
 		return false
 	}
-
-	if obj.Pkg() == nil {
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok {
 		return false
 	}
-	return obj.Pkg() == pkg.Types && obj.Parent() == pkg.Types.Scope()
+	return sig.Recv() == nil
 }
 
 // isPkgSelector returns pkgPath if sel is pkg.Sel
@@ -378,7 +384,7 @@ func isEmbeddedSel(sel *ast.SelectorExpr, info *types.Info) (pkgPath, bool) {
 	}
 
 	v, ok := s.Obj().(*types.Var)
-	if !ok {
+	if !ok || !v.Anonymous() {
 		return "", false
 	}
 
@@ -404,6 +410,26 @@ func isEmbeddedSel(sel *ast.SelectorExpr, info *types.Info) (pkgPath, bool) {
 		return "", false
 	}
 	return pp, true
+}
+
+func isPkgLevelIdent(pkg *packages.Package, info *types.Info, id *ast.Ident) bool {
+	if id == nil || id.Name == "_" {
+		return false
+	}
+
+	var obj types.Object
+	if o := info.Uses[id]; o != nil {
+		obj = o
+	} else if o := info.Defs[id]; o != nil {
+		obj = o
+	} else {
+		return false
+	}
+
+	if obj.Pkg() == nil {
+		return false
+	}
+	return obj.Pkg() == pkg.Types && obj.Parent() == pkg.Types.Scope()
 }
 
 func isEmbeddedFieldKey(id *ast.Ident, info *types.Info) (pkgPath, bool) {

@@ -24,7 +24,6 @@ func AnalyzeReachableDecls(main *packages.Package, topoPkg []*packages.Package) 
 	a.collectReferencedDecls()
 	a.buildDeclGraph()
 	a.propagateDeclReachability()
-	a.closeMethodsByType()
 	return a.reachableDecls
 }
 
@@ -57,6 +56,9 @@ func (a *ReachabilityAnalyzer) buildSSA() {
 func (a *ReachabilityAnalyzer) analyzeRTA() {
 	roots := rootsPkgs(a.ssaPkgs)
 	res := rta.Analyze(roots, true)
+	if res == nil {
+		panic("res is nil")
+	}
 	for fn := range res.Reachable {
 		a.reachableFn[fn] = true
 	}
@@ -176,6 +178,14 @@ func (a *ReachabilityAnalyzer) propagateDeclReachability() {
 		}
 		a.reachableDecls[cur] = true
 
+		if tn, ok := cur.(*types.TypeName); ok {
+			for _, m := range methodOfType(tn) {
+				if !a.reachableDecls[m] {
+					queue = append(queue, m)
+				}
+			}
+		}
+
 		for _, next := range a.declGraph[cur] {
 			if !a.reachableDecls[next] {
 				queue = append(queue, next) // push
@@ -184,30 +194,19 @@ func (a *ReachabilityAnalyzer) propagateDeclReachability() {
 	}
 }
 
-func (a *ReachabilityAnalyzer) closeMethodsByType() {
-	for _, pkg := range a.topoPkgs {
-		scope := pkg.Types.Scope()
-		for _, name := range scope.Names() {
-			obj := scope.Lookup(name)
-			tn, ok := obj.(*types.TypeName)
-			if !ok || !a.reachableDecls[tn] {
-				continue
-			}
-
-			// 利用のある型のメソッドを全部reachableにする
-			// interface越しの利用を検知できないので。
-			T := tn.Type()
-			for _, typ := range []types.Type{T, types.NewPointer(T)} {
-				mset := types.NewMethodSet(typ)
-				for i := 0; i < mset.Len(); i++ {
-					sel := mset.At(i)
-					if fn, ok := sel.Obj().(*types.Func); ok {
-						a.reachableDecls[fn] = true
-					}
-				}
-			}
-		}
+func methodOfType(tn *types.TypeName) []types.Object {
+	named, ok := tn.Type().(*types.Named)
+	if !ok {
+		return nil
 	}
+	if named.Obj().Pkg() == nil {
+		return nil
+	}
+	ret := make([]types.Object, 0)
+	for i := 0; i < named.NumMethods(); i++ {
+		ret = append(ret, named.Method(i))
+	}
+	return ret
 }
 
 func rootsPkgs(pkgs []*ssa.Package) []*ssa.Function {
@@ -277,7 +276,6 @@ func (v *declUseVisitor) Visit(n ast.Node) ast.Visitor {
 
 	// nodeに入るタイミング
 	v.push(n)
-
 
 	// reachableな関数で利用のある要素なら、reachableDeclに追加
 	id, ok := n.(*ast.Ident)

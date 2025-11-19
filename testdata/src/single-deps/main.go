@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/authns/summarizer/testdata/src/single-deps/lib"
+	"github.com/Atnuhs/go-bundler/testdata/src/single-deps/lib"
 )
 
 func init_sub() {
@@ -38,6 +38,14 @@ func (d Embedded) String() {
 	fmt.Println(d.LibStruct.V)
 }
 
+type NonEmbedded struct {
+	s lib.LibStruct
+}
+
+func (d NonEmbedded) String() {
+	fmt.Println(d.s.V)
+}
+
 type Seeker interface {
 	Seek()
 }
@@ -62,8 +70,10 @@ func main() {
 	lib.LibStruct1.V = 10
 	data := Embedded{lib.LibStruct{}}
 	data2 := Embedded{LibStruct: lib.LibStruct{}}
+	data3 := NonEmbedded{s: lib.LibStruct{}}
 	fmt.Println(data.V)
 	fmt.Println(data2.V)
+	fmt.Println(data3.s.V)
 	fmt.Println(HOGE11)
 	fmt.Println(X1)
 	FunctionWithArg(10)
